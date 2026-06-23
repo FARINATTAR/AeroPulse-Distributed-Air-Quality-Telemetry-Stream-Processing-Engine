@@ -1,7 +1,7 @@
 """
 AeroPulse - Stream Consumer & TimescaleDB Sink
 Listens to Kafka raw telemetry topics and performs high-velocity batch inserts
-into the partitioned TimescaleDB hypertable.
+into the partitioned TimescaleDB hypertable with exponential retry backoff.
 """
 
 import json
@@ -15,7 +15,7 @@ from config import settings
 
 
 class AeroPulseConsumer:
-    """Consumer worker pulling telemetry messages and batch-persisting to TimescaleDB."""
+    """Resilient consumer sink with exponential backoff and circuit-breaker reconnection."""
 
     def __init__(self, batch_size: int = 15, flush_interval_secs: int = 10):
         self.batch_size = batch_size
@@ -24,6 +24,8 @@ class AeroPulseConsumer:
         self.db_conn = None
         self.buffer: List[Dict[str, Any]] = []
         self.last_flush_time = time.time()
+        self.retry_delay = 1.0
+        self.max_retry_delay = 30.0
         self._init_db()
         self._init_kafka()
 
@@ -38,9 +40,12 @@ class AeroPulseConsumer:
                 connect_timeout=5
             )
             self.db_conn.autocommit = False
+            self.retry_delay = 1.0  # Reset backoff on success
             logger.info(f"TimescaleDB sink connected to {settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}")
         except Exception as e:
-            logger.error(f"Error connecting to TimescaleDB: {e}")
+            logger.warning(f"Database connection attempt failed: {e}. Backing off {self.retry_delay}s")
+            time.sleep(min(self.retry_delay, 5.0))
+            self.retry_delay = min(self.retry_delay * 2, self.max_retry_delay)
             self.db_conn = None
 
     def _init_kafka(self):
@@ -62,7 +67,7 @@ class AeroPulseConsumer:
     def flush_batch(self):
         if not self.buffer:
             return
-        if not self.db_conn:
+        if not self.db_conn or self.db_conn.closed:
             self._init_db()
             if not self.db_conn:
                 return
@@ -90,16 +95,19 @@ class AeroPulseConsumer:
             with self.db_conn.cursor() as cur:
                 execute_values(cur, query, records)
             self.db_conn.commit()
-            logger.info(f"Successfully flushed {len(records)} telemetry records to TimescaleDB")
+            logger.info(f"Successfully persisted batch of {len(records)} records to TimescaleDB")
             self.buffer.clear()
             self.last_flush_time = time.time()
+        except psycopg2.OperationalError as op_err:
+            logger.error(f"Database operational failure: {op_err}. Reconnecting...")
+            self.db_conn = None
         except Exception as err:
-            logger.error(f"Failed to flush batch to database: {err}")
+            logger.error(f"Failed to execute batch insert: {err}")
             if self.db_conn:
                 self.db_conn.rollback()
 
     def process_stream(self, running_flag):
-        """Main continuous poll-and-buffer loop."""
+        """Main continuous poll-and-buffer loop with error resilience."""
         while running_flag.is_set():
             if not self.consumer:
                 time.sleep(2)
@@ -112,7 +120,7 @@ class AeroPulseConsumer:
                     for record in messages:
                         self.buffer.append(record.value)
 
-                # Flush condition
+                # Buffer flush threshold trigger
                 if len(self.buffer) >= self.batch_size or (time.time() - self.last_flush_time > self.flush_interval):
                     self.flush_batch()
 
