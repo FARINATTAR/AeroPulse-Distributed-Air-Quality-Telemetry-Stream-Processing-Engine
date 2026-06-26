@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Distributed Coordination
+  # Zookeeper - Kafka Cluster Coordination
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: aeropulse-zookeeper
@@ -13,7 +13,7 @@ services:
     networks:
       - aeropulse-network
 
-  # Apache Kafka Message Broker
+  # Apache Kafka - Distributed Streaming Broker
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: aeropulse-kafka
@@ -34,7 +34,7 @@ services:
     networks:
       - aeropulse-network
 
-  # Web Dashboard for Kafka Management
+  # Kafka UI Console
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: aeropulse-kafka-ui
@@ -47,6 +47,68 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     networks:
       - aeropulse-network
+
+  # TimescaleDB (Time-series PostgreSQL engine)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: aeropulse-timescaledb
+    environment:
+      POSTGRES_DB: aeropulse
+      POSTGRES_USER: aeropulse_admin
+      POSTGRES_PASSWORD: aeropulse_secure_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - aeropulse-network
+
+  # Grafana Analytics & Dashboards
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: aeropulse-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - timescaledb
+    networks:
+      - aeropulse-network
+
+  # AeroPulse Engine (Ingestion + Kafka Producer & Consumer)
+  aeropulse-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aeropulse-engine
+    depends_on:
+      - kafka
+      - timescaledb
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - POSTGRES_HOST=timescaledb
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=aeropulse
+      - POSTGRES_USER=aeropulse_admin
+      - POSTGRES_PASSWORD=aeropulse_secure_2026
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY:-demo_mock_key}
+    volumes:
+      - ./src:/app/src
+      - ./logs:/app/logs
+    networks:
+      - aeropulse-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  grafana_data:
 
 networks:
   aeropulse-network:
