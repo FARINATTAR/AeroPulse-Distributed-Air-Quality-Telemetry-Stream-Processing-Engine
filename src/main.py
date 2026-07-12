@@ -16,15 +16,28 @@ from kafka_producer import AeroPulseProducer
 from kafka_consumer import AeroPulseConsumer
 
 
+def configure_structured_logging():
+    """Sets up customized log formatting with clean stream prefixes."""
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>",
+        level=settings.LOG_LEVEL,
+        colorize=True
+    )
+
+
 class AeroPulseOrchestrator:
     """Manages concurrent background producer and consumer stream workers."""
 
     def __init__(self):
+        configure_structured_logging()
         self.collector = AeroPulseDataCollector()
         self.producer = AeroPulseProducer()
-        self.consumer = AeroPulseConsumer()
+        self.consumer = AeroPulseConsumer(batch_size=20, flush_interval_secs=8)
         self.running = Event()
         self.running.set()
+        self.total_cycles = 0
         self._setup_signals()
 
     def _setup_signals(self):
@@ -32,32 +45,38 @@ class AeroPulseOrchestrator:
         signal.signal(signal.SIGTERM, self._handle_shutdown)
 
     def _handle_shutdown(self, signum, frame):
-        logger.warning("Shutdown signal received. Stopping AeroPulse workers gracefully...")
+        logger.warning("Graceful shutdown initiated. Terminating AeroPulse pipelines...")
         self.running.clear()
 
     def collect_and_publish_cycle(self):
         """Polls target stations and emits enriched events onto Kafka topic."""
-        logger.info(f"Triggering scheduled ingestion cycle for {len(settings.TARGET_CITIES)} stations...")
+        self.total_cycles += 1
+        logger.info(f"[Cycle #{self.total_cycles}] Dispatching ingestion batch across {len(settings.TARGET_CITIES)} stations...")
+        dispatched_count = 0
         for city in settings.TARGET_CITIES:
             packet = self.collector.fetch_city_telemetry(city)
-            if packet:
-                self.producer.publish_telemetry(packet)
+            if packet and self.producer.publish_telemetry(packet):
+                dispatched_count += 1
         self.producer.flush()
+        logger.info(f"[Cycle #{self.total_cycles}] Emitted {dispatched_count} telemetry packets to Kafka.")
 
     def start(self):
-        logger.info(f"Starting {settings.APP_NAME} Distributed Streaming Platform...")
+        logger.info(f"==================================================")
+        logger.info(f"  {settings.APP_NAME} Distributed Streaming Platform Online")
+        logger.info(f"  Brokers: {settings.KAFKA_BOOTSTRAP_SERVERS}")
+        logger.info(f"  Database: {settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}")
+        logger.info(f"==================================================")
 
-        # Run initial collection immediately
+        # Immediate first cycle
         self.collect_and_publish_cycle()
 
-        # Schedule recurring ingestion every 5 minutes
+        # Background scheduling
         schedule.every(settings.COLLECTION_INTERVAL_MINUTES).minutes.do(self.collect_and_publish_cycle)
 
-        # Start consumer sink on dedicated daemon thread
+        # Consumer worker on worker thread
         consumer_thread = Thread(target=self.consumer.process_stream, args=(self.running,), daemon=True)
         consumer_thread.start()
 
-        # Main scheduler event loop
         try:
             while self.running.is_set():
                 schedule.run_pending()
@@ -65,7 +84,7 @@ class AeroPulseOrchestrator:
         finally:
             self.stop()
             consumer_thread.join(timeout=3)
-            logger.info("AeroPulse pipeline halted successfully.")
+            logger.info("AeroPulse engine successfully disconnected.")
 
     def stop(self):
         self.running.clear()
